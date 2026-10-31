@@ -129,19 +129,75 @@ type SpawnSpec struct {
 	Kind        TaskKind
 	WorkingDir  string
 	// Env holds extra "KEY=VALUE" entries layered onto the process environment for
-	// this command (see ToolContext.Env). Empty = inherit unchanged.
+	// this command (see ToolContext.Env). Empty still applies nonInteractiveEnv.
 	Env []string
 }
 
-// withEnv returns the current process environment extended with extra
-// "KEY=VALUE" entries, or nil when extra is empty (child inherits unchanged).
-// os/exec dedups by key — case-insensitive on Windows, keeping the LAST
-// occurrence — so the appended entries override inherited ones on every OS.
+// nonInteractiveEnv are defaults every spawned shell gets, whether or not the
+// host passes any env of its own: a pager must never block a non-interactive
+// shell waiting for a terminal nobody is watching, and Debian package frontends
+// must never prompt. These deliberately override values inherited from the
+// agent's own process — an operator who exports PAGER=less for their shell would
+// otherwise hand every child a pager that hangs. A host that names the same key
+// explicitly still wins (see withEnv).
+var nonInteractiveEnv = []string{
+	"PAGER=cat",
+	"GIT_PAGER=cat",
+	"SYSTEMD_PAGER=cat",
+	"DEBIAN_FRONTEND=noninteractive",
+}
+
+// withEnv builds the child environment, in precedence order:
+//
+//	process environment  <  nonInteractiveEnv defaults  <  the host's extra vars
+//
+// Each layer is applied by DROPPING the earlier entry for that key rather than
+// appending a duplicate. os/exec's own dedup would resolve duplicates in favour
+// of the last occurrence, so appending alone would work for a child it spawns;
+// dropping makes the slice correct on its own terms, so it also reads correctly
+// anywhere it is inspected, logged, or handed to something that does not dedup.
+// (mcp/stdio.go relies on exec's last-wins dedup and is fine as it is.)
+//
+// The result is never nil — the defaults always apply.
 func withEnv(extra []string) []string {
-	if len(extra) == 0 {
-		return nil
+	extraKeys := make(map[string]bool, len(extra))
+	for _, kv := range extra {
+		if k := envKey(kv); k != "" {
+			extraKeys[k] = true
+		}
 	}
-	return append(os.Environ(), extra...)
+	drop := make(map[string]bool, len(extraKeys)+len(nonInteractiveEnv))
+	for k := range extraKeys {
+		drop[k] = true
+	}
+	for _, kv := range nonInteractiveEnv {
+		if k := envKey(kv); k != "" && !extraKeys[k] {
+			drop[k] = true
+		}
+	}
+	base := os.Environ()
+	out := make([]string, 0, len(base)+len(nonInteractiveEnv)+len(extra))
+	for _, kv := range base {
+		if k := envKey(kv); k != "" && drop[k] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	for _, kv := range nonInteractiveEnv {
+		if k := envKey(kv); k != "" && extraKeys[k] {
+			continue // host override wins
+		}
+		out = append(out, kv)
+	}
+	return append(out, extra...)
+}
+
+// envKey extracts the KEY of a "KEY=value" entry ("" when malformed).
+func envKey(kv string) string {
+	if i := strings.IndexByte(kv, '='); i > 0 {
+		return kv[:i]
+	}
+	return ""
 }
 
 // Manager owns the background tasks of one Session.
@@ -187,7 +243,17 @@ func NewManager(sessionID string) (*Manager, error) {
 	}, nil
 }
 
-// cleanStaleSessions removes sibling session directories older than the TTL.
+// cleanStaleSessions removes sibling session directories older than the TTL —
+// those belong to sessions that died without running Cleanup (crash, SIGKILL).
+//
+// Staleness is judged by the NEWEST mtime in the directory, not the session
+// dir's own. MkdirAll stamps <base>/<sessionID> once and all writes land in
+// <sessionID>/tasks, so the session dir's mtime is frozen at creation and never
+// refreshed by activity: judging by it alone deletes a session that is alive and
+// busy but simply older than the TTL, out from under itself — Manager.Output
+// then fails with ENOENT and watchSize silently stops enforcing the output cap.
+// Output files are appended to as a task runs, so their mtimes are the signal
+// that something is still using this directory.
 func cleanStaleSessions(base, current string) {
 	entries, err := os.ReadDir(base)
 	if err != nil {
@@ -198,14 +264,48 @@ func cleanStaleSessions(base, current string) {
 		if !e.IsDir() || e.Name() == current {
 			continue
 		}
-		info, err := e.Info()
+		dir := filepath.Join(base, e.Name())
+		if newestMTime(dir).Before(cutoff) {
+			_ = os.RemoveAll(dir)
+		}
+	}
+}
+
+// newestMTime returns the most recent mtime of dir or anything one level below
+// it (<sessionID>/tasks and the output files inside). One level is enough: the
+// layout is fixed at <base>/<sessionID>/tasks/<file>.
+func newestMTime(dir string) time.Time {
+	var newest time.Time
+	bump := func(t time.Time) {
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	if fi, err := os.Stat(dir); err == nil {
+		bump(fi.ModTime())
+	}
+	subs, err := os.ReadDir(dir)
+	if err != nil {
+		return newest
+	}
+	for _, s := range subs {
+		if info, err := s.Info(); err == nil {
+			bump(info.ModTime())
+		}
+		if !s.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(dir, s.Name()))
 		if err != nil {
 			continue
 		}
-		if info.ModTime().Before(cutoff) {
-			_ = os.RemoveAll(filepath.Join(base, e.Name()))
+		for _, f := range files {
+			if info, err := f.Info(); err == nil {
+				bump(info.ModTime())
+			}
 		}
 	}
+	return newest
 }
 
 // Spawn launches a process detached from the per-turn context. Its output streams
@@ -230,9 +330,7 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	shell, flags := shellCmd()
 	cmd := exec.CommandContext(m.rootCtx, shell, append(flags, spec.Command)...)
 	cmd.Dir = spec.WorkingDir
-	if env := withEnv(spec.Env); env != nil {
-		cmd.Env = env
-	}
+	cmd.Env = withEnv(spec.Env)
 	cmd.Stdout = f
 	cmd.Stderr = f
 	setDetached(cmd)
@@ -510,18 +608,34 @@ func (m *Manager) DrainNotifications() []Notification {
 	return out
 }
 
-// Cleanup kills all tasks, cancels the root context, and removes the session's
-// task directory. Safe to call on a nil Manager.
+// Cleanup kills all tasks, closes PTY sessions, removes the session's task
+// directory and cancels the root context. Safe to call on a nil Manager.
+//
+// Removing the directory does strand the "full output saved to <path>" pointers
+// that were handed to the model, which is a real cost. It is still the right
+// trade: agentcore mints a fresh random sessionID per Session, so keeping the
+// directory means every run of the host leaves one behind, each task file capped
+// only at maxTaskOutputBytes (50 MiB), with the stale sweep below as the sole
+// reclaimer — and that sweep runs only inside NewManager, so a host that stops
+// opening sessions never reclaims at all. Deterministic cleanup at a known cost
+// beats unbounded growth in the host's temp dir.
+//
+// Those pointers are consumed inside the session that produced them. Making
+// them genuinely durable needs spill output to live in a host-chosen directory
+// with its own retention policy, not in os.TempDir() keyed by a per-session
+// UUID; that is a design change, not a change to this function.
 func (m *Manager) Cleanup() {
 	if m == nil {
 		return
 	}
 	m.KillAll()
 	m.closeAllSessions()
+	if m.dir != "" {
+		_ = os.RemoveAll(filepath.Dir(m.dir)) // <base>/<sessionID>, not just its tasks/
+	}
 	if m.rootCancel != nil {
 		m.rootCancel()
 	}
-	_ = os.RemoveAll(filepath.Dir(m.dir)) // <base>/<sessionID>
 }
 
 // tailFile reads the last maxBytes of a file, prefixing a notice when earlier
@@ -555,7 +669,12 @@ func tailFile(path string, maxBytes int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("[%d KB of earlier output omitted — read the output file directly for full output]\n", off/1024) + string(b), nil
+	// Seeking to a byte offset lands mid-rune for any multi-byte output, and
+	// this tail goes straight to the model via Manager.Output/TaskOutput — the
+	// harness-level capture net leaves it alone because it is already under the
+	// limit. cutTail drops the partial leading rune.
+	tail := string(b)[runeSafeStart(b):]
+	return fmt.Sprintf("[%d KB of earlier output omitted — read the output file directly for full output]\n", off/1024) + tail, nil
 }
 
 // shellCmd returns the platform shell and the argument flags that precede the
@@ -575,7 +694,9 @@ func short(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.ReplaceAll(s, "\n", " ")
 	if len(s) > 60 {
-		return s[:57] + "..."
+		// This lands in notification summaries, so a CJK/emoji command must not
+		// be cut mid-rune into a replacement character.
+		return cutHead(s, 57) + "..."
 	}
 	return s
 }
