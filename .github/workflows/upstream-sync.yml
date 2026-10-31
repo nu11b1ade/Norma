@@ -59,6 +59,16 @@ jobs:
           fi
 
           branch="upstream/${latest}"
+
+          # A merged PR means this release was already synced, even when the
+          # merge was squashed and the upstream commit is not an ancestor.
+          merged="$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --head "$branch" --state merged --json number --jq '.[0].number // empty')"
+          if [ -n "$merged" ]; then
+            echo "PR #$merged already merged $latest."
+            exit 0
+          fi
+
           existing="$(gh pr list --repo "$GITHUB_REPOSITORY" \
             --head "$branch" --state open --json number --jq '.[0].number // empty')"
           if [ -n "$existing" ]; then
