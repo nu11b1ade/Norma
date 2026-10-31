@@ -66,7 +66,7 @@ func TestBackgroundTaskEndToEnd(t *testing.T) {
 	}
 
 	// The session's task temp dir exists while the task runs.
-	taskDir := filepath.Join(os.TempDir(), "norma", sess.SessionID())
+	taskDir := filepath.Join(os.TempDir(), "agent-tasks", sess.SessionID())
 	if _, err := os.Stat(taskDir); err != nil {
 		t.Fatalf("task dir should exist: %v", err)
 	}

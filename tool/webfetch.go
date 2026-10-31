@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/norma/internal/httpx"
 	"github.com/Autumn-27/norma/permission"
 	"golang.org/x/net/html"
 )
@@ -68,12 +69,18 @@ func NewWebFetch(cfg WebFetchConfig) CoreTool {
 const maxFetchBytes = 2 << 20 // 2 MiB
 
 // newFetchClient returns an HTTP client honoring the proxy / TLS config.
-func newFetchClient(cfg WebFetchConfig) *http.Client {
-	if cfg.Proxy == "" && !cfg.InsecureTLS && cfg.CACert == "" {
-		return &http.Client{}
-	}
-	tr := &http.Transport{}
+//
+// browser selects the browser request profile: Chrome's redirect referrer
+// policy and a browser UA on proxy CONNECT (the transport builds that request
+// itself, so it cannot inherit the headers set on the target request). Server
+// API calls use browser=false and keep net/http's defaults, which is what the
+// official Go SDKs do.
+func newFetchClient(cfg WebFetchConfig, browser bool) *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
 	if cfg.Proxy != "" {
+		// Disable the environment proxy when an explicit one is configured: a
+		// URL that fails to parse means "direct", not "fall back to env".
+		tr.Proxy = nil
 		if pu, err := url.Parse(cfg.Proxy); err == nil {
 			tr.Proxy = http.ProxyURL(pu)
 		}
@@ -94,7 +101,14 @@ func newFetchClient(cfg WebFetchConfig) *http.Client {
 			}
 		}
 	}
-	return &http.Client{Transport: tr}
+	if browser {
+		tr.ProxyConnectHeader = http.Header{"User-Agent": []string{httpx.BrowserUserAgent}}
+	}
+	client := &http.Client{Transport: tr}
+	if browser {
+		client.CheckRedirect = httpx.BrowserCheckRedirect
+	}
+	return client
 }
 
 // proxyLikelyErr reports whether a fetch error is the kind a recording/MITM proxy
@@ -156,14 +170,14 @@ func staticAssetExt(rawURL string) string {
 }
 
 func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *ToolContext) (Result, error) {
-	client := newFetchClient(cfg)
+	client := newFetchClient(cfg, true)
 	// direct is the no-proxy fallback used when a proxied fetch fails for a
 	// proxy-caused reason (closed tunnel / failed CONNECT / TLS or HTTP2 mismatch):
 	// it bypasses the configured proxy so a recording/MITM hiccup doesn't fail an
 	// otherwise-reachable URL. nil when no proxy is configured (nothing to bypass).
 	var direct *http.Client
 	if cfg.Proxy != "" {
-		direct = newFetchClient(WebFetchConfig{InsecureTLS: cfg.InsecureTLS})
+		direct = newFetchClient(WebFetchConfig{InsecureTLS: cfg.InsecureTLS}, true)
 	}
 	return func(ctx context.Context, input json.RawMessage, _ *ToolContext) (Result, error) {
 		var in struct {
@@ -185,14 +199,14 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 		if err != nil {
 			return Errorf("Error: " + err.Error()), nil
 		}
-		req.Header.Set("user-agent", "norma/0.4")
+		httpx.SetBrowserNavigation(req.Header, in.URL)
 		resp, err := client.Do(req)
 		// One direct retry when the proxied attempt failed for a proxy-caused reason.
 		// A non-proxy error (bad host, caller timeout/cancel) is returned as-is — a
 		// direct retry wouldn't fix it. The direct response is NOT captured by the proxy.
 		if err != nil && direct != nil && proxyLikelyErr(err) {
 			if r2, e2 := http.NewRequestWithContext(cctx, http.MethodGet, in.URL, nil); e2 == nil {
-				r2.Header.Set("user-agent", "norma/0.4")
+				httpx.SetBrowserNavigation(r2.Header, in.URL)
 				if resp2, err2 := direct.Do(r2); err2 == nil {
 					resp, err = resp2, nil
 				} else {

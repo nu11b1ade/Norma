@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,6 +32,10 @@ func doStream(ctx context.Context, cfg Config, url string, body []byte, setHeade
 			return nil, err
 		}
 		setHeaders(req)
+		// The SDK identity reports the attempt number, not a constant 0.
+		if req.Header.Get("X-Stainless-Retry-Count") != "" {
+			req.Header.Set("X-Stainless-Retry-Count", strconv.Itoa(attempt))
+		}
 
 		resp, err := cfg.HTTPClient.Do(req)
 		if err == nil && resp.StatusCode == http.StatusOK {

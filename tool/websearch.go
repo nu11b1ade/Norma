@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/norma/internal/httpx"
 	"github.com/Autumn-27/norma/permission"
 	"golang.org/x/net/html"
 )
@@ -106,22 +107,26 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 	if backend == "" {
 		backend = "ddgs"
 	}
-	client := newFetchClient(WebFetchConfig{Proxy: cfg.Proxy, CACert: cfg.CACert, InsecureTLS: cfg.InsecureTLS})
+	netCfg := WebFetchConfig{Proxy: cfg.Proxy, CACert: cfg.CACert, InsecureTLS: cfg.InsecureTLS}
 	switch backend {
 	case "ddgs":
-		return &ddgsProvider{client: client, endpoint: ddgsEndpoint}, nil
+		// A scraped HTML endpoint expects a browser page load; use the full
+		// browser profile (including proxy CONNECT and redirect policy).
+		return &ddgsProvider{client: newFetchClient(netCfg, true), endpoint: ddgsEndpoint}, nil
 	case "brave-free":
 		key := strings.TrimSpace(cfg.BraveAPIKey)
 		if key == "" {
 			return nil, fmt.Errorf("web_search: backend %q requires a Brave Search API key", backend)
 		}
-		return &braveProvider{apiKey: key, client: client, endpoint: braveEndpoint}, nil
+		// A server-side JSON API call has no page origin or Sec-Fetch-* that a
+		// real browser would send, so keep the Go client's default identity.
+		return &braveProvider{apiKey: key, client: newFetchClient(netCfg, false), endpoint: braveEndpoint}, nil
 	case "tavily":
 		key := strings.TrimSpace(cfg.TavilyAPIKey)
 		if key == "" {
 			return nil, fmt.Errorf("web_search: backend %q requires a Tavily API key", backend)
 		}
-		return &tavilyProvider{apiKey: key, client: client, endpoint: tavilyEndpoint}, nil
+		return &tavilyProvider{apiKey: key, client: newFetchClient(netCfg, false), endpoint: tavilyEndpoint}, nil
 	case "deepseek":
 		key := strings.TrimSpace(cfg.DeepSeekAPIKey)
 		if key == "" {
@@ -135,7 +140,7 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 		if model == "" {
 			return nil, fmt.Errorf("web_search: backend %q requires a model name", backend)
 		}
-		return &deepseekProvider{apiKey: key, model: model, client: client, endpoint: deepseekMessagesURL(base)}, nil
+		return &deepseekProvider{apiKey: key, model: model, client: newFetchClient(netCfg, false), endpoint: deepseekMessagesURL(base)}, nil
 	default:
 		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", or \"deepseek\")", backend)
 	}
@@ -220,9 +225,9 @@ func (p *ddgsProvider) Search(ctx context.Context, query string, limit int) ([]S
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	// A browser-like UA — the endpoint blocks obviously-automated clients.
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
-	req.Header.Set("Referer", "https://html.duckduckgo.com/")
+	// The endpoint blocks obviously-automated clients; present the full
+	// same-origin browser form submission, not just a browser UA.
+	httpx.SetBrowserFormNavigation(req.Header, p.endpoint)
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -333,6 +338,7 @@ func (p *braveProvider) Search(ctx context.Context, query string, limit int) ([]
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Subscription-Token", p.apiKey)
+	// Deliberately no browser identity: this is a server-side API call.
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -399,6 +405,7 @@ func (p *tavilyProvider) Search(ctx context.Context, query string, limit int) ([
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	// Deliberately no browser identity: this is a server-side API call.
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -506,9 +513,10 @@ func (p *deepseekProvider) Search(ctx context.Context, query string, limit int) 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-api-key", p.apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	httpx.SetAnthropicSDK(req.Header)
 
 	resp, err := p.client.Do(req)
 	if err != nil {

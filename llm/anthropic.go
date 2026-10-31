@@ -7,6 +7,8 @@ import (
 	"io"
 	"iter"
 	"net/http"
+
+	"github.com/Autumn-27/norma/internal/httpx"
 )
 
 type anthropicProvider struct{ cfg Config }
@@ -113,10 +115,11 @@ func (p *anthropicProvider) Stream(ctx context.Context, req CompletionRequest) i
 			return
 		}
 		resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/v1/messages", body, func(r *http.Request) {
+			httpx.SetAnthropicSDK(r.Header)
 			r.Header.Set("content-type", "application/json")
 			r.Header.Set("x-api-key", p.cfg.APIKey)
 			r.Header.Set("anthropic-version", p.cfg.APIVersion)
-			r.Header.Set("accept", "text/event-stream")
+			r.Header.Set("accept", "application/json")
 		}, "anthropic")
 		if err != nil {
 			yield(StreamEvent{}, err)
@@ -160,6 +163,7 @@ func (p *anthropicProvider) Complete(ctx context.Context, req CompletionRequest)
 		return Message{}, "", Usage{}, err
 	}
 	resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/v1/messages", body, func(r *http.Request) {
+		httpx.SetAnthropicSDK(r.Header)
 		r.Header.Set("content-type", "application/json")
 		r.Header.Set("x-api-key", p.cfg.APIKey)
 		r.Header.Set("anthropic-version", p.cfg.APIVersion)

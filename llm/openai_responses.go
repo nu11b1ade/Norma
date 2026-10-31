@@ -8,6 +8,8 @@ import (
 	"iter"
 	"net/http"
 	"strings"
+
+	"github.com/Autumn-27/norma/internal/httpx"
 )
 
 // openaiResponsesProvider speaks the OpenAI Responses API (POST /v1/responses),
@@ -124,6 +126,7 @@ func toResponsesInput(msgs []Message) []orInputItem {
 }
 
 func (p *openaiResponsesProvider) setHeaders(r *http.Request) {
+	httpx.SetOpenAISDK(r.Header)
 	r.Header.Set("content-type", "application/json")
 	r.Header.Set("authorization", "Bearer "+p.cfg.APIKey)
 }
@@ -139,7 +142,7 @@ func (p *openaiResponsesProvider) Stream(ctx context.Context, req CompletionRequ
 		}
 		resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/responses", body, func(r *http.Request) {
 			p.setHeaders(r)
-			r.Header.Set("accept", "text/event-stream")
+			r.Header.Set("accept", "application/json")
 		}, "openai-responses")
 		if err != nil {
 			yield(StreamEvent{}, err)

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Autumn-27/norma/internal/httpx"
 )
 
 func TestReadHardening(t *testing.T) {
@@ -163,7 +165,16 @@ func TestRenderTodoReminder(t *testing.T) {
 }
 
 func TestWebFetch(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != httpx.BrowserUserAgent {
+			t.Errorf("User-Agent = %q, want the browser profile", got)
+		}
+		if got := r.Header.Get("Sec-Fetch-Site"); got != "none" {
+			t.Errorf("Sec-Fetch-Site = %q, want none for a typed URL", got)
+		}
+		if got := r.Header.Get("Accept"); !strings.Contains(got, "text/html") {
+			t.Errorf("Accept = %q, want a navigation Accept", got)
+		}
 		w.Header().Set("content-type", "text/html")
 		w.Write([]byte(`<html><body><script>secret()</script><h1>Title</h1><p>Hello &amp; bye</p></body></html>`))
 	}))
@@ -362,6 +373,67 @@ func mustFetch(t *testing.T, raw []byte) string {
 		t.Fatalf("webfetch: %v", err)
 	}
 	return res.Flatten()
+}
+
+// TestFetchClientProfiles checks the two client identities stay distinct: the
+// browser profile also covers proxy CONNECT and redirects, while server API
+// clients keep net/http's own behavior (what the official Go SDKs use).
+func TestFetchClientProfiles(t *testing.T) {
+	browser := newFetchClient(WebFetchConfig{Proxy: "http://127.0.0.1:1"}, true)
+	btr, ok := browser.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("browser transport = %T, want *http.Transport", browser.Transport)
+	}
+	if got := btr.ProxyConnectHeader.Get("User-Agent"); got != httpx.BrowserUserAgent {
+		t.Errorf("CONNECT User-Agent = %q, want the browser profile", got)
+	}
+	if browser.CheckRedirect == nil {
+		t.Error("browser client must apply Chrome's redirect referrer policy")
+	}
+
+	api := newFetchClient(WebFetchConfig{}, false)
+	atr, ok := api.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("API transport = %T, want *http.Transport", api.Transport)
+	}
+	if got := atr.ProxyConnectHeader.Get("User-Agent"); got != "" {
+		t.Errorf("API CONNECT User-Agent = %q, want the Go default", got)
+	}
+	if api.CheckRedirect != nil {
+		t.Error("API client should keep net/http's redirect behavior")
+	}
+}
+
+// TestWebFetchRedirectReferrerPolicy proves redirects use Chrome's
+// strict-origin-when-cross-origin policy while a typed navigation keeps
+// Sec-Fetch-Site: none across the hop.
+func TestWebFetchRedirectReferrerPolicy(t *testing.T) {
+	referers := make(chan string, 1)
+	secFetch := make(chan string, 1)
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		referers <- r.Header.Get("Referer")
+		secFetch <- r.Header.Get("Sec-Fetch-Site")
+		w.Header().Set("content-type", "text/html")
+		w.Write([]byte("<html><body><h1>Redirected</h1></body></html>"))
+	}))
+	defer final.Close()
+
+	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+"/page", http.StatusFound)
+	}))
+	defer start.Close()
+
+	raw, _ := json.Marshal(map[string]any{"url": start.URL})
+	out := mustFetch(t, raw)
+	if !strings.Contains(out, "Redirected") {
+		t.Fatalf("fetch did not follow the redirect: %q", out)
+	}
+	if got, want := <-referers, start.URL+"/"; got != want {
+		t.Errorf("redirect Referer = %q, want %q", got, want)
+	}
+	if got := <-secFetch; got != "none" {
+		t.Errorf("Sec-Fetch-Site after redirect = %q, want none", got)
+	}
 }
 
 // TestBashEnvInjection proves ToolContext.Env is layered into the Bash

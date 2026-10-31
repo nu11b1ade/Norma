@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/Autumn-27/norma/internal/httpx"
 )
 
 func TestNewWebSearchConfig(t *testing.T) {
@@ -44,6 +46,15 @@ func TestDDGSSearchParse(t *testing.T) {
 		if err := r.ParseForm(); err != nil || r.Form.Get("q") == "" {
 			t.Errorf("expected form q param, got err=%v form=%v", err, r.Form)
 		}
+		if got := r.Header.Get("User-Agent"); got != httpx.BrowserUserAgent {
+			t.Errorf("User-Agent = %q, want the browser profile", got)
+		}
+		if got := r.Header.Get("Sec-Fetch-Site"); got != "same-origin" {
+			t.Errorf("Sec-Fetch-Site = %q, want same-origin", got)
+		}
+		if want := "http://" + r.Host; r.Header.Get("Origin") != want || r.Header.Get("Referer") != want {
+			t.Errorf("Origin/Referer = %q/%q, want %q", r.Header.Get("Origin"), r.Header.Get("Referer"), want)
+		}
 		w.Header().Set("Content-Type", "text/html")
 		_, _ = w.Write([]byte(page))
 	}))
@@ -79,6 +90,12 @@ func TestBraveSearchParse(t *testing.T) {
 		if got := r.Header.Get("X-Subscription-Token"); got != "secret-key" {
 			t.Errorf("missing/incorrect auth header: %q", got)
 		}
+		if got := r.Header.Get("User-Agent"); got == httpx.BrowserUserAgent || strings.Contains(got, "Chrome") {
+			t.Errorf("User-Agent = %q, want a non-browser API client", got)
+		}
+		if got := r.Header.Get("Sec-Fetch-Site"); got != "" {
+			t.Errorf("Sec-Fetch-Site = %q, want no browser fetch metadata", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"web":{"results":[
 			{"title":"T1","url":"https://a.example","description":"D1"},
@@ -111,11 +128,66 @@ func TestBraveHTTPError(t *testing.T) {
 	}
 }
 
+func TestTavilySearchParse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got == httpx.BrowserUserAgent || strings.Contains(got, "Chrome") {
+			t.Errorf("User-Agent = %q, want a non-browser API client", got)
+		}
+		if got := r.Header.Get("Sec-Fetch-Site"); got != "" {
+			t.Errorf("Sec-Fetch-Site = %q, want no browser fetch metadata", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[
+			{"title":"T1","url":"https://a.example","content":"C1"},
+			{"title":"T2","url":"https://b.example","content":"C2"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	p := &tavilyProvider{apiKey: "secret-key", client: srv.Client(), endpoint: srv.URL}
+	res, err := p.Search(context.Background(), "q", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res) != 2 || res[0].Title != "T1" || res[1].URL != "https://b.example" || res[1].Description != "C2" {
+		t.Fatalf("bad parse: %+v", res)
+	}
+}
+
+// TestDDGSRedirectCrossSiteSecFetchSite proves the DDG form profile follows
+// Fetch Metadata's redirect rule: a same-origin form submission redirected to a
+// different site reports cross-site, even when the redirect changes scheme.
+func TestDDGSRedirectCrossSiteSecFetchSite(t *testing.T) {
+	sites := make(chan string, 1)
+	final := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sites <- r.Header.Get("Sec-Fetch-Site")
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte(`<html><body></body></html>`))
+	}))
+	defer final.Close()
+
+	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+"/result", http.StatusFound)
+	}))
+	defer start.Close()
+
+	p := &ddgsProvider{
+		client:   newFetchClient(WebFetchConfig{InsecureTLS: true}, true),
+		endpoint: start.URL,
+	}
+	if _, err := p.Search(context.Background(), "q", 5); err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if got := <-sites; got != "cross-site" {
+		t.Errorf("Sec-Fetch-Site after redirect = %q, want cross-site", got)
+	}
+}
+
 func TestUnwrapDDGHref(t *testing.T) {
 	cases := map[string]string{
 		"//duckduckgo.com/l/?uddg=https%3A%2F%2Fx.com%2Fy&rut=z": "https://x.com/y",
-		"https://plain.example/path":                            "https://plain.example/path",
-		"":                                                      "",
+		"https://plain.example/path":                             "https://plain.example/path",
+		"":                                                       "",
 	}
 	for in, want := range cases {
 		if got := unwrapDDGHref(in); got != want {

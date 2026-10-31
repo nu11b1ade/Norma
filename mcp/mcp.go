@@ -175,12 +175,20 @@ type remoteTool struct {
 	InputSchema map[string]any `json:"inputSchema"`
 }
 
+// clientName/clientVersion identify this MCP client during the initialize
+// handshake. They are deliberately generic: the name reaches every server and
+// its logs, so the SDK does not advertise itself there.
+const (
+	clientName    = "mcp-client"
+	clientVersion = "1.0.0"
+)
+
 // initialize performs the MCP handshake.
 func (c *Client) initialize(ctx context.Context) error {
 	_, err := c.conn.call(ctx, "initialize", map[string]any{
 		"protocolVersion": "2024-11-05",
 		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "norma", "version": "0.2"},
+		"clientInfo":      map[string]any{"name": clientName, "version": clientVersion},
 	})
 	if err != nil {
 		return err

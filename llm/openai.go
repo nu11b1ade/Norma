@@ -8,6 +8,8 @@ import (
 	"iter"
 	"net/http"
 	"strings"
+
+	"github.com/Autumn-27/norma/internal/httpx"
 )
 
 type openaiProvider struct{ cfg Config }
@@ -292,9 +294,10 @@ func (p *openaiProvider) Stream(ctx context.Context, req CompletionRequest) iter
 		}
 		for attempt := 0; ; attempt++ {
 			resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/chat/completions", body, func(r *http.Request) {
+				httpx.SetOpenAISDK(r.Header)
 				r.Header.Set("content-type", "application/json")
 				r.Header.Set("authorization", "Bearer "+p.cfg.APIKey)
-				r.Header.Set("accept", "text/event-stream")
+				r.Header.Set("accept", "application/json")
 			}, "openai")
 			if err != nil {
 				yield(StreamEvent{}, err)
@@ -385,6 +388,7 @@ func (p *openaiProvider) Complete(ctx context.Context, req CompletionRequest) (M
 	}
 	for attempt := 0; ; attempt++ {
 		resp, err := doStream(ctx, p.cfg, p.cfg.BaseURL+"/chat/completions", body, func(r *http.Request) {
+			httpx.SetOpenAISDK(r.Header)
 			r.Header.Set("content-type", "application/json")
 			r.Header.Set("authorization", "Bearer "+p.cfg.APIKey)
 			r.Header.Set("accept", "application/json")
