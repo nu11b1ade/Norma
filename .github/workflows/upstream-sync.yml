@@ -1,0 +1,99 @@
+# Tracks Autumn-27/Norma release tags and opens a PR against main when a new
+# version appears. It never merges by itself: a human reviews and merges.
+name: Upstream release sync
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-release-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Open a PR for the latest upstream tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: Autumn-27/Norma
+        run: |
+          set -euo pipefail
+
+          upstream_url="https://github.com/${UPSTREAM_REPO}.git"
+          latest="$(git ls-remote --tags --refs "$upstream_url" 'v*' \
+            | awk '{print $2}' \
+            | sed 's#^refs/tags/##' \
+            | grep -E '^v[0-9]+(\.[0-9]+)+$' \
+            | sort -V \
+            | tail -n 1)"
+
+          if [ -z "$latest" ]; then
+            echo "No upstream version tags found."
+            exit 0
+          fi
+          echo "Latest upstream tag: $latest"
+
+          git fetch --no-tags "$upstream_url" \
+            "refs/tags/${latest}:refs/remotes/upstream/${latest}"
+          upstream_sha="$(git rev-parse "refs/remotes/upstream/${latest}^{commit}")"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "$latest is already contained in main."
+            exit 0
+          fi
+
+          branch="upstream/${latest}"
+          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "PR #$existing already tracks $latest."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B "$branch" origin/main
+
+          conflict=0
+          if ! git merge --no-edit "$upstream_sha"; then
+            conflict=1
+            git merge --abort
+            # Keep a PR visible even when the merge conflicts: point the branch
+            # at the upstream tag so the conflicts can be resolved in the PR.
+            git checkout -B "$branch" "$upstream_sha"
+          fi
+
+          git push --force origin "$branch"
+
+          body="Automated upstream sync for [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO}) tag \`${latest}\`.
+
+          Upstream release: https://github.com/${UPSTREAM_REPO}/releases/tag/${latest}
+
+          Review this PR and merge it when you are ready. This workflow never merges automatically."
+
+          if [ "$conflict" -ne 0 ]; then
+            body="${body}
+
+          **Conflict notice:** the automatic merge hit conflicts, so this branch points at the upstream tag directly. Resolve the conflicts in this PR before merging."
+          fi
+
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "Merge upstream ${latest}" \
+            --body "$body"
